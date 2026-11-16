@@ -97,3 +97,45 @@ def get_clerk_user(clerk_id: str) -> dict | None:
     if not isinstance(data, dict):
         raise ClerkBackendError('Unexpected Clerk user response.')
     return data
+
+
+def find_clerk_user_by_email(email: str) -> dict | None:
+    """Look up a single Clerk user by email address (case-insensitive)."""
+    target = (email or '').strip().lower()
+    if not target:
+        return None
+    try:
+        response = requests.get(
+            f'{CLERK_API_BASE}/users',
+            headers=_headers(),
+            params={'email_address': [target], 'limit': 10},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        logger.exception('Clerk find user by email failed: %s', exc)
+        raise ClerkBackendError('Failed to look up user in Clerk.') from exc
+
+    if not response.ok:
+        logger.error('Clerk find user by email HTTP %s: %s', response.status_code, response.text[:300])
+        raise ClerkBackendError('Failed to look up user in Clerk.')
+
+    batch = _parse_user_list(response.json())
+    matches = []
+    for item in batch:
+        if not isinstance(item, dict) or not item.get('id'):
+            continue
+        emails = item.get('email_addresses') or []
+        if any(
+            isinstance(entry, dict)
+            and str(entry.get('email_address') or '').strip().lower() == target
+            for entry in emails
+        ):
+            matches.append(item)
+
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise ClerkBackendError(
+            f'Multiple Clerk users matched email "{target}". Use --clerk-id instead.'
+        )
+    return matches[0]
