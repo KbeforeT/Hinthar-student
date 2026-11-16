@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from people.models import Subject, Teacher, Student, Staff, AuditLog, SCHOOL_CHOICES
@@ -10,6 +11,7 @@ class UserSerializer(serializers.ModelSerializer):
     teacher_profile_id = serializers.PrimaryKeyRelatedField(read_only=True, source='teacher_profile.id')
     student_profile_id = serializers.PrimaryKeyRelatedField(read_only=True, source='student_profile.id')
     staff_profile_id = serializers.PrimaryKeyRelatedField(read_only=True, source='staff_profile.id')
+    children_ids = serializers.SerializerMethodField()
     
     class Meta:
         model = User
@@ -22,6 +24,7 @@ class UserSerializer(serializers.ModelSerializer):
             'teacher_profile_id', 
             'student_profile_id',
             'staff_profile_id',
+            'children_ids',
             'is_active'
         ]
         read_only_fields = [
@@ -30,11 +33,20 @@ class UserSerializer(serializers.ModelSerializer):
             'teacher_profile_id',
             'student_profile_id',
             'staff_profile_id',
+            'children_ids',
             'role',
             'is_active',
             'username',
             'email',
         ]
+
+    @extend_schema_field(serializers.ListField(child=serializers.IntegerField()))
+    def get_children_ids(self, obj):
+        return list(
+            Student.objects.filter(Q(parent=obj) | Q(user=obj))
+            .values_list('id', flat=True)
+            .distinct()
+        )
 
     def validate_role(self, value):
         from people.roles import ROLE_RANK
@@ -132,6 +144,7 @@ class TeacherSerializer(serializers.ModelSerializer):
 
 class StudentSerializer(serializers.ModelSerializer):
     user_id = serializers.PrimaryKeyRelatedField(read_only=True, source='user.id')
+    parent_id = serializers.PrimaryKeyRelatedField(read_only=True, source='parent.id')
     school_code = serializers.ChoiceField(choices=SCHOOL_CHOICES, required=True)
     class_labels = serializers.SerializerMethodField()
     class_ids = serializers.SerializerMethodField()
@@ -140,11 +153,11 @@ class StudentSerializer(serializers.ModelSerializer):
         model = Student
         fields = [
             'id', 'unique_code', 'exam_candidate_number', 'name', 'dob', 'enrollment_date',
-            'contact', 'school_code', 'user_id', 'check_in_token', 'check_in_token_active',
+            'contact', 'school_code', 'user_id', 'parent_id', 'check_in_token', 'check_in_token_active',
             'class_labels', 'class_ids',
         ]
         read_only_fields = [
-            'unique_code', 'check_in_token', 'check_in_token_active',
+            'unique_code', 'parent_id', 'check_in_token', 'check_in_token_active',
             'class_labels', 'class_ids',
         ]
 

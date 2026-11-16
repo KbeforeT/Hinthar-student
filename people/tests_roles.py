@@ -719,3 +719,51 @@ class UserDeleteAndDeactivateTests(APITestCase):
         self.assertNotIn(self.admin.id, inactive_ids)
 
 
+class ParentAccountLinkTests(APITestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(
+            username='plink_admin', role='admin', clerk_id='clerk_plink_admin'
+        )
+        self.pending = User.objects.create_user(
+            username='plink_parent', role='pending', clerk_id='clerk_plink_parent'
+        )
+        self.child1 = Student.objects.create(name='Child One')
+        self.child2 = Student.objects.create(name='Child Two')
+
+    def test_admin_can_link_multiple_children_to_one_parent(self):
+        self.client.force_authenticate(user=self.admin)
+        res1 = self.client.post(
+            f'/api/v1/students/{self.child1.id}/link_parent/',
+            {'user_id': self.pending.id},
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data['parent_id'], self.pending.id)
+
+        res2 = self.client.post(
+            f'/api/v1/students/{self.child2.id}/link_parent/',
+            {'user_id': self.pending.id},
+            format='json',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.pending.refresh_from_db()
+        self.assertEqual(self.pending.role, 'parent')
+
+        # Check /me/ returns both children_ids
+        self.client.force_authenticate(user=self.pending)
+        me = self.client.get('/api/v1/me/')
+        self.assertEqual(me.status_code, status.HTTP_200_OK)
+        self.assertEqual(set(me.data['children_ids']), {self.child1.id, self.child2.id})
+
+        # Unlinking both demotes back to pending
+        self.client.force_authenticate(user=self.admin)
+        self.client.post(f'/api/v1/students/{self.child1.id}/unlink_parent/')
+        self.pending.refresh_from_db()
+        self.assertEqual(self.pending.role, 'parent')
+        self.client.post(f'/api/v1/students/{self.child2.id}/unlink_parent/')
+        self.pending.refresh_from_db()
+        self.assertEqual(self.pending.role, 'pending')
+
+
+

@@ -46,7 +46,7 @@ from people.user_guards import deactivate_blockers, delete_blockers
 
 User = get_user_model()
 
-STUDENT_LINKABLE_USER_ROLES = frozenset({'pending', 'student'})
+STUDENT_LINKABLE_USER_ROLES = frozenset({'pending', 'student', 'parent'})
 TEACHER_LINKABLE_USER_ROLES = frozenset({'pending', 'teacher'})
 
 
@@ -445,7 +445,7 @@ class TeacherViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
 
 
 class StudentViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
-    queryset = Student.objects.select_related('user').order_by('id')
+    queryset = Student.objects.select_related('user', 'parent').order_by('id')
     serializer_class = StudentSerializer
     permission_classes = [IsStaffOrAbove]
     ordering = ['id']
@@ -673,7 +673,7 @@ class StudentViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if target.role not in STUDENT_LINKABLE_USER_ROLES:
+        if target.role not in ('pending', 'student'):
             return Response(
                 {'error': f'Cannot link a {target.role} account to a student.'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -727,6 +727,87 @@ class StudentViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
             student.user = None
             student.save(update_fields=['user'])
             if previous.role == 'student':
+                previous.role = 'pending'
+                previous.save(update_fields=['role'])
+
+        serializer = self.get_serializer(student)
+        return Response(serializer.data)
+
+    @extend_schema(
+        request=inline_serializer(
+            name='LinkStudentParentRequest',
+            fields={'user_id': drf_serializers.IntegerField()},
+        ),
+        responses={200: StudentSerializer},
+        summary='Link a parent Clerk account to this student',
+        description=(
+            'Admin only. Sets Student.parent and promotes pending accounts to parent. '
+            'One parent account can be linked to multiple students.'
+        ),
+    )
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def link_parent(self, request, pk=None):
+        student = self.get_object()
+        raw_id = request.data.get('user_id')
+        try:
+            user_id = int(raw_id)
+        except (TypeError, ValueError):
+            return Response(
+                {'error': 'user_id is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            target = User.objects.get(pk=user_id)
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if target.role not in ('pending', 'parent'):
+            return Response(
+                {'error': f'Cannot link a {target.role} account as a parent.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if _user_has_other_profile(target) or Student.objects.filter(user=target).exists():
+            return Response(
+                {'error': 'This account is already linked to an individual student, teacher, or staff profile.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            student.parent = target
+            student.save(update_fields=['parent'])
+            if target.role != 'parent':
+                target.role = 'parent'
+                target.save(update_fields=['role'])
+
+        serializer = self.get_serializer(student)
+        return Response(serializer.data)
+
+    @extend_schema(
+        responses={200: StudentSerializer},
+        summary='Unlink the parent account from this student',
+        description=(
+            'Admin only. Clears Student.parent. If the account role is parent and '
+            'no other children remain linked, it is set back to pending.'
+        ),
+    )
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def unlink_parent(self, request, pk=None):
+        student = self.get_object()
+        previous = student.parent
+        if previous is None:
+            return Response(
+                {'error': 'This student does not have a linked parent account.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            student.parent = None
+            student.save(update_fields=['parent'])
+            if previous.role == 'parent' and not previous.children.exists():
                 previous.role = 'pending'
                 previous.save(update_fields=['role'])
 

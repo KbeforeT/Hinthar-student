@@ -1,212 +1,212 @@
-from datetime import date, timedelta
+from datetime import date, datetime, time
 from decimal import Decimal
-from unittest.mock import patch
 
-from django.contrib.auth import get_user_model
-from django.urls import reverse
 from django.utils import timezone
+from rest_framework import status
 from rest_framework.test import APITestCase
 
-from academics.models import AcademicYear
-from people.models import Staff, Student
-from .models import FeePayment, StaffSalary, StudentFee
+from class_sessions.models import AdHocSession, Session
+from people.models import Subject, Teacher, User
+from timetable.models import Class, TimetableSlot
+
+from .models import CohortRateOverride, TeacherPayout, TeacherRateCard
 
 
-class FinanceAPITestCase(APITestCase):
+class PayrollTeacherRateEngineTests(APITestCase):
     def setUp(self):
-        User = get_user_model()
-        user_fields = {field.name for field in User._meta.fields}
-        values = {"username": "finance-admin", "password": "test-password",
-                  "is_staff": True, "is_superuser": False}
-        if "clerk_id" in user_fields:
-            values["clerk_id"] = "test-finance-admin"
-        if "role" in user_fields:
-            values["role"] = "admin"
-        self.admin = User.objects.create_user(**values)
-        self.client.force_authenticate(self.admin)
-
-        # Adapt these fixtures if your external models have other required fields.
-        self.student = Student.objects.create(name="Test Student")
-        self.staff = Staff.objects.create(name="Test Employee")
-        self.year = AcademicYear.objects.create(
-            name="2026-2027", start_date=date(2026, 6, 1), end_date=date(2027, 5, 31)
+        self.admin = User.objects.create_user(
+            username="pay-admin", clerk_id="clerk-pay-admin", role="admin"
         )
-        self.fee = StudentFee.objects.create(
-            student=self.student, academic_year=self.year,
-            fee_type=StudentFee.FeeType.TUITION, amount_due=Decimal("100.00"),
-            due_date=timezone.localdate() + timedelta(days=30),
+        self.staff = User.objects.create_user(
+            username="pay-staff", clerk_id="clerk-pay-staff", role="staff"
+        )
+        self.teacher_user = User.objects.create_user(
+            username="pay-teacher", clerk_id="clerk-pay-teacher", role="teacher"
+        )
+        self.client.force_authenticate(self.staff)
+
+        self.teacher1 = Teacher.objects.create(
+            name="Dr. Ratio", employment_type="full_time", school_code="HIS"
+        )
+        self.teacher2 = Teacher.objects.create(
+            name="Yae Miko", employment_type="tutor", school_code="HIS"
+        )
+        self.cohort_k2b = Class.objects.create(
+            education_level="IG", cohort_identifier="K", cohort_sub_category="2B"
+        )
+        self.cohort_k4 = Class.objects.create(
+            education_level="IG", cohort_identifier="K", cohort_sub_category="4"
+        )
+        self.math = Subject.objects.create(name="Mathematics")
+
+        self.slot_k2b = TimetableSlot.objects.create(
+            class_obj=self.cohort_k2b,
+            subject=self.math,
+            teacher=self.teacher1,
+            day_of_week=0,
+            start_time=time(9, 0),
+            end_time=time(10, 30),
+            room="R101",
+        )
+        self.slot_k4 = TimetableSlot.objects.create(
+            class_obj=self.cohort_k4,
+            subject=self.math,
+            teacher=self.teacher1,
+            day_of_week=2,
+            start_time=time(13, 0),
+            end_time=time(15, 0),
+            room="R102",
         )
 
-    def pay(self, amount):
-        return self.client.post(reverse("fee-payment-list"), {
-            "student_fee": self.fee.pk, "amount_paid": str(amount),
-            "payment_date": timezone.localdate().isoformat(), "payment_method": "cash",
-        }, format="json")
+        tz = timezone.get_current_timezone()
+        # Completed session in IG K2B (1.5h) taught by teacher1
+        Session.objects.create(
+            timetable_slot=self.slot_k2b,
+            teacher=self.teacher1,
+            class_obj=self.cohort_k2b,
+            start_time=timezone.make_aware(datetime(2026, 11, 2, 9, 0), tz),
+            end_time=timezone.make_aware(datetime(2026, 11, 2, 10, 30), tz),
+            status="completed",
+        )
+        # Scheduled session in IG K4 (2.0h) taught by teacher1
+        Session.objects.create(
+            timetable_slot=self.slot_k4,
+            teacher=self.teacher1,
+            class_obj=self.cohort_k4,
+            start_time=timezone.make_aware(datetime(2026, 11, 4, 13, 0), tz),
+            end_time=timezone.make_aware(datetime(2026, 11, 4, 15, 0), tz),
+            status="scheduled",
+        )
+        # Cancelled session in IG K2B (must NOT be paid)
+        Session.objects.create(
+            timetable_slot=self.slot_k2b,
+            teacher=self.teacher1,
+            class_obj=self.cohort_k2b,
+            start_time=timezone.make_aware(datetime(2026, 11, 9, 9, 0), tz),
+            end_time=timezone.make_aware(datetime(2026, 11, 9, 10, 30), tz),
+            status="cancelled",
+        )
+        # Substitute cover session: assigned to teacher1, actually taught by teacher2!
+        Session.objects.create(
+            timetable_slot=self.slot_k2b,
+            teacher=self.teacher1,
+            actual_teacher=self.teacher2,
+            class_obj=self.cohort_k2b,
+            start_time=timezone.make_aware(datetime(2026, 11, 16, 9, 0), tz),
+            end_time=timezone.make_aware(datetime(2026, 11, 16, 10, 30), tz),
+            status="completed",
+        )
+        # Ad-hoc tutoring session taught by teacher2 (1.0h)
+        AdHocSession.objects.create(
+            teacher=self.teacher2,
+            subject=self.math,
+            date=date(2026, 11, 18),
+            start_time=time(16, 0),
+            end_time=time(17, 0),
+            status="completed",
+        )
 
-    @staticmethod
-    def rows(response):
-        return response.data["results"] if isinstance(response.data, dict) else response.data
+    def test_upsert_rate_card_with_cohort_overrides_and_per_session_payout(self):
+        # Teacher 1: per-session base = 20,000; IG K4 override = 30,000
+        res = self.client.post(
+            "/api/v1/teacher-rate-cards/upsert/",
+            {
+                "teacher_id": self.teacher1.pk,
+                "rate_type": "rate_per_session",
+                "rate_per_session": "20000.00",
+                "hourly_rate": "15000.00",
+                "currency": "MMK",
+                "cohort_overrides": [
+                    {"class_obj_id": self.cohort_k4.pk, "rate_per_session": "30000.00"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(len(res.data["cohort_overrides"]), 1)
 
+        # Calculate payouts for 2026-11
+        calc = self.client.post(
+            "/api/v1/teacher-payouts/calculate/",
+            {"month": "2026-11"},
+            format="json",
+        )
+        self.assertEqual(calc.status_code, status.HTTP_200_OK, calc.data)
+        payouts = {p["teacher"]: p for p in calc.data["payouts"]}
 
-class StudentFeeAPITests(FinanceAPITestCase):
-    def test_create_ignores_client_status(self):
-        response = self.client.post(reverse("student-fee-list"), {
-            "student": self.student.pk, "academic_year": self.year.pk,
-            "fee_type": "library", "amount_due": "25.00",
-            "due_date": (timezone.localdate() + timedelta(days=10)).isoformat(),
-            "status": "paid",
-        }, format="json")
-        self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(response.data["status"], "pending")
+        p1 = payouts[self.teacher1.pk]
+        # Teacher 1 taught 2 sessions: 1 in IG K2B (20,000) + 1 in IG K4 (30,000 override) = 50,000
+        # Cancelled session and covered session (actual_teacher=teacher2) are excluded.
+        self.assertEqual(p1["sessions_count"], 2)
+        self.assertEqual(p1["completed_sessions_count"], 1)
+        self.assertEqual(p1["scheduled_sessions_count"], 1)
+        self.assertEqual(p1["session_earnings"], "50000.00")
+        self.assertEqual(p1["net_payout"], "50000.00")
+        self.assertEqual(len(p1["session_breakdown"]["sessions"]), 2)
+        self.assertEqual(len(p1["session_breakdown"]["cohorts"]), 2)
 
-    def test_nested_payments_and_filters(self):
-        self.assertEqual(self.pay("25.00").status_code, 201)
-        response = self.client.get(reverse("student-fee-list"), {
-            "student_id": self.student.pk, "status": "partial",
-        })
-        self.assertEqual(response.status_code, 200)
-        rows = self.rows(response)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["payments"][0]["amount_paid"], "25.00")
-        response = self.client.get(reverse("student-fee-list"), {"status": "paid"})
-        self.assertEqual(len(self.rows(response)), 0)
+    def test_hourly_rate_override_adjustments_and_status_transitions(self):
+        # Teacher 2: hourly_rate base = 10,000/hr, IG K2B override = 16,000/hr
+        self.client.post(
+            "/api/v1/teacher-rate-cards/upsert/",
+            {
+                "teacher_id": self.teacher2.pk,
+                "rate_type": "hourly_rate",
+                "rate_per_session": "0.00",
+                "hourly_rate": "10000.00",
+                "currency": "MMK",
+                "cohort_overrides": [
+                    {"class_obj_id": self.cohort_k2b.pk, "hourly_rate": "16000.00"},
+                ],
+            },
+            format="json",
+        )
 
-    def test_overdue_updates_at_read_time_without_payment(self):
-        tomorrow_after_due = self.fee.due_date + timedelta(days=1)
-        with patch("payroll.models.timezone.localdate", return_value=tomorrow_after_due):
-            response = self.client.get(reverse("student-fee-list"), {"status": "overdue"})
-        self.assertEqual(len(self.rows(response)), 1)
-        self.assertEqual(self.rows(response)[0]["status"], "overdue")
+        res = self.client.get("/api/v1/teacher-payouts/", {"month": "2026-11"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        rows = res.data["results"] if isinstance(res.data, dict) else res.data
+        p2 = next(r for r in rows if r["teacher"] == self.teacher2.pk)
 
-    def test_cannot_reduce_fee_below_payments(self):
-        self.pay("50.00")
-        response = self.client.patch(reverse("student-fee-detail", args=[self.fee.pk]),
-                                     {"amount_due": "40.00"}, format="json")
-        self.assertEqual(response.status_code, 400)
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.amount_due, Decimal("100.00"))
+        # 1.5h substitute in IG K2B @ 16,000/hr = 24,000 + 1.0h ad-hoc @ 10,000/hr = 10,000 -> 34,000
+        self.assertEqual(p2["sessions_count"], 2)
+        self.assertEqual(p2["total_hours"], "2.50")
+        self.assertEqual(p2["session_earnings"], "34000.00")
+        self.assertEqual(p2["status"], "draft")
 
-    def test_cannot_delete_fee_with_payments(self):
-        self.pay("20.00")
-        response = self.client.delete(reverse("student-fee-detail", args=[self.fee.pk]))
-        self.assertEqual(response.status_code, 400)
-        self.assertTrue(StudentFee.objects.filter(pk=self.fee.pk).exists())
+        # Apply manual bonus (+5,000) and deduction (-2,000) -> 37,000
+        patched = self.client.patch(
+            f"/api/v1/teacher-payouts/{p2['id']}/",
+            {
+                "bonus": "5000.00",
+                "deduction": "2000.00",
+                "adjustment_note": "Substitute cover bonus minus late penalty",
+            },
+            format="json",
+        )
+        self.assertEqual(patched.status_code, status.HTTP_200_OK, patched.data)
+        self.assertEqual(patched.data["net_payout"], "37000.00")
 
-    def test_anonymous_and_inactive_admin_denied(self):
-        self.client.force_authenticate(user=None)
-        self.assertIn(self.client.get(reverse("student-fee-list")).status_code, (401, 403))
-        self.admin.is_active = False
-        self.admin.save()
-        self.client.force_authenticate(self.admin)
-        self.assertEqual(self.client.get(reverse("student-fee-list")).status_code, 403)
+        # Transition: draft -> approved -> paid
+        approved = self.client.post(
+            f"/api/v1/teacher-payouts/{p2['id']}/transition/",
+            {"status": "approved"},
+            format="json",
+        )
+        self.assertEqual(approved.status_code, status.HTTP_200_OK, approved.data)
+        self.assertEqual(approved.data["status"], "approved")
+        self.assertIsNotNone(approved.data["approved_at"])
+        self.assertIsNone(approved.data["paid_at"])
 
+        paid = self.client.post(
+            f"/api/v1/teacher-payouts/{p2['id']}/transition/",
+            {"status": "paid"},
+            format="json",
+        )
+        self.assertEqual(paid.status_code, status.HTTP_200_OK, paid.data)
+        self.assertEqual(paid.data["status"], "paid")
+        self.assertIsNotNone(paid.data["paid_at"])
 
-class FeePaymentAPITests(FinanceAPITestCase):
-    def test_partial_then_paid(self):
-        self.assertEqual(self.pay("40.00").status_code, 201)
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.status, StudentFee.Status.PARTIAL)
-        self.assertEqual(self.pay("60.00").status_code, 201)
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.status, StudentFee.Status.PAID)
-
-    def test_model_save_updates_status_without_serializer(self):
-        FeePayment.objects.create(student_fee=self.fee, amount_paid=Decimal("100.00"),
-                                  payment_method="bank_transfer")
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.status, StudentFee.Status.PAID)
-
-    def test_overdue_precedence_until_fully_paid(self):
-        self.fee.due_date = timezone.localdate() - timedelta(days=1)
-        self.fee.save()
-        self.pay("10.00")
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.status, StudentFee.Status.OVERDUE)
-        self.pay("90.00")
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.status, StudentFee.Status.PAID)
-
-    def test_edit_and_delete_recalculate_status(self):
-        payment_id = self.pay("100.00").data["id"]
-        url = reverse("fee-payment-detail", args=[payment_id])
-        response = self.client.patch(url, {"amount_paid": "30.00"}, format="json")
-        self.assertEqual(response.status_code, 200, response.data)
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.status, StudentFee.Status.PARTIAL)
-        self.assertEqual(self.client.delete(url).status_code, 204)
-        self.fee.refresh_from_db()
-        self.assertEqual(self.fee.status, StudentFee.Status.PENDING)
-
-    def test_overpayments_zero_and_negative_rejected(self):
-        for amount in ("101.00", "0.00", "-1.00"):
-            self.assertEqual(self.pay(amount).status_code, 400)
-        self.assertEqual(self.fee.payments.count(), 0)
-
-    def test_payment_cannot_move_to_another_fee(self):
-        payment_id = self.pay("20.00").data["id"]
-        other = StudentFee.objects.create(student=self.student, academic_year=self.year,
-                                          fee_type="exam", amount_due=Decimal("50.00"),
-                                          due_date=self.fee.due_date)
-        response = self.client.patch(reverse("fee-payment-detail", args=[payment_id]),
-                                     {"student_fee": other.pk}, format="json")
-        self.assertEqual(response.status_code, 400)
-
-
-class StaffSalaryAPITests(FinanceAPITestCase):
-    def salary_payload(self, **changes):
-        data = {"staff": self.staff.pk, "month": "2026-09-15", "base_salary": "1000.00",
-                "allowances": "200.00", "deductions": "50.00"}
-        data.update(changes)
-        return data
-
-    def test_net_salary_calculated_and_read_only(self):
-        response = self.client.post(reverse("staff-salary-list"),
-                                    self.salary_payload(net_salary="999999.00"), format="json")
-        self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(response.data["net_salary"], "1150.00")
-        self.assertEqual(response.data["month"], "2026-09-01")
-        salary = StaffSalary.objects.get(pk=response.data["id"])
-        self.assertEqual(salary.net_salary, Decimal("1150.00"))
-
-    def test_patch_recalculates_net_salary(self):
-        response = self.client.post(reverse("staff-salary-list"), self.salary_payload(), format="json")
-        url = reverse("staff-salary-detail", args=[response.data["id"]])
-        response = self.client.patch(url, {"allowances": "300.00", "net_salary": "1.00"}, format="json")
-        self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["net_salary"], "1250.00")
-
-    def test_model_save_calculates_net_salary(self):
-        salary = StaffSalary.objects.create(staff=self.staff, month=date(2026, 9, 20),
-                                            base_salary=Decimal("500.00"))
-        self.assertEqual(salary.net_salary, Decimal("500.00"))
-        self.assertEqual(salary.month, date(2026, 9, 1))
-
-    def test_duplicate_employee_month_rejected(self):
-        self.client.post(reverse("staff-salary-list"), self.salary_payload(), format="json")
-        response = self.client.post(reverse("staff-salary-list"),
-                                    self.salary_payload(month="2026-09-30"), format="json")
-        self.assertEqual(response.status_code, 400)
-
-    def test_invalid_deductions_and_payment_date_rejected(self):
-        for changes in ({"deductions": "1201.00"}, {"status": "paid"},
-                        {"payment_date": "2026-09-30"}, {"base_salary": "-1.00"}):
-            response = self.client.post(reverse("staff-salary-list"),
-                                        self.salary_payload(**changes), format="json")
-            self.assertEqual(response.status_code, 400, response.data)
-
-    def test_staff_and_status_filters(self):
-        response = self.client.post(reverse("staff-salary-list"), self.salary_payload(
-            status="paid", payment_date="2026-09-30"), format="json")
-        self.assertEqual(response.status_code, 201, response.data)
-        response = self.client.get(reverse("staff-salary-list"), {"staff_id": self.staff.pk, "status": "paid"})
-        self.assertEqual(len(self.rows(response)), 1)
-        response = self.client.get(reverse("staff-salary-list"), {"status": "pending"})
-        self.assertEqual(len(self.rows(response)), 0)
-
-    def test_non_admin_cannot_read_salaries(self):
-        self.admin.is_staff = False
-        if hasattr(self.admin, "role"):
-            self.admin.role = "staff"
-        self.admin.save()
-        response = self.client.get(reverse("staff-salary-list"))
-        self.assertEqual(response.status_code, 403)
+    def test_non_staff_cannot_access_payroll(self):
+        self.client.force_authenticate(self.teacher_user)
+        self.assertEqual(self.client.get("/api/v1/teacher-rate-cards/").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get("/api/v1/teacher-payouts/").status_code, status.HTTP_403_FORBIDDEN)

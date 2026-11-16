@@ -10,6 +10,7 @@ Clerk provides identity only. Roles live on people.User and are changed by admin
 ROLE_RANK = {
     'pending': 0,
     'student': 1,
+    'parent': 1,
     'teacher': 2,
     'terminal': 3,
     'staff': 4,
@@ -50,6 +51,10 @@ def is_terminal_or_above(user) -> bool:
 
 def is_teacher_or_above(user) -> bool:
     return role_rank(user) >= ROLE_RANK['teacher']
+
+
+def is_parent(user) -> bool:
+    return is_active_account(user) and getattr(user, 'role', None) == 'parent'
 
 
 def is_at_least(user, role: str) -> bool:

@@ -10,6 +10,7 @@ class User(AbstractUser):
         ('staff', 'Staff'),
         ('teacher', 'Teacher'),
         ('student', 'Student'),
+        ('parent', 'Parent'),
         ('terminal', 'Terminal'),
     ]
     
@@ -86,6 +87,14 @@ class Student(models.Model):
         null=True,
         blank=True,
         related_name='student_profile'
+    )
+    # Optional link to a Parent user account (a parent can have multiple children)
+    parent = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='children'
     )
 
     def save(self, *args, **kwargs):
