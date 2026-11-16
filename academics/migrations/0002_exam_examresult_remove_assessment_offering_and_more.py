@@ -7,6 +7,22 @@ from django.conf import settings
 from django.db import migrations, models
 
 
+def deduplicate_terms(apps, schema_editor):
+    Term = apps.get_model('academics', 'Term')
+    year_ids = list(Term.objects.values_list('academic_year_id', flat=True).distinct())
+    for year_id in year_ids:
+        terms = list(Term.objects.filter(academic_year_id=year_id).order_by('number', 'id'))
+        if len(terms) > 2:
+            extra_ids = [t.id for t in terms[2:]]
+            Term.objects.filter(id__in=extra_ids).delete()
+        if len(terms) >= 2:
+            Term.objects.filter(pk=terms[1].pk).update(number=2, term_type='final')
+        if len(terms) >= 1:
+            Term.objects.filter(pk=terms[0].pk).update(number=1, term_type='midterm')
+    if schema_editor.connection.vendor == 'postgresql':
+        schema_editor.execute('SET CONSTRAINTS ALL IMMEDIATE')
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -103,6 +119,7 @@ class Migration(migrations.Migration):
             name='number',
             field=models.PositiveSmallIntegerField(choices=[(1, 'Midterm'), (2, 'Final Term')]),
         ),
+        migrations.RunPython(deduplicate_terms, migrations.RunPython.noop),
         migrations.AddConstraint(
             model_name='term',
             constraint=models.UniqueConstraint(fields=('academic_year', 'number'), name='unique_year_term'),
