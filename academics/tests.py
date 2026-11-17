@@ -388,6 +388,72 @@ class AcademicsExamTrackingTests(TestCase):
         ]:
             self.assertEqual(grade_for(Decimal(pct)), expected)
 
+    def test_academic_year_conflict_and_label_validation(self):
+        # Reversed label like 2028-2027 must be rejected
+        reversed_year = self.client.post(
+            "/api/v1/academic-years/",
+            {"name": "2028-2027", "start_date": "2026-06-01", "end_date": "2027-05-31"},
+            format="json",
+        )
+        self.assertEqual(reversed_year.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Non-consecutive label like 2027-2029 must be rejected
+        non_consecutive = self.client.post(
+            "/api/v1/academic-years/",
+            {"name": "2027-2029", "start_date": "2027-06-01", "end_date": "2029-05-31"},
+            format="json",
+        )
+        self.assertEqual(non_consecutive.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Mismatched date years for label 2027-2028 must be rejected
+        mismatched = self.client.post(
+            "/api/v1/academic-years/",
+            {"name": "2027-2028", "start_date": "2026-06-01", "end_date": "2027-05-31"},
+            format="json",
+        )
+        self.assertEqual(mismatched.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Overlapping date window with existing 2026-2027 (2026-06-01 .. 2027-05-31) must be rejected
+        overlap = self.client.post(
+            "/api/v1/academic-years/",
+            {"name": "2027-2028", "start_date": "2027-05-15", "end_date": "2028-05-31"},
+            format="json",
+        )
+        self.assertEqual(overlap.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_exam_date_outside_academic_year_rejected_and_flagged(self):
+        outside = self.client.post(
+            "/api/v1/exams/",
+            {
+                "term": self.midterm.pk,
+                "class_obj": self.cohort.pk,
+                "subject": self.math.pk,
+                "exam_date": "2028-10-12",
+                "start_time": "09:00",
+                "end_time": "11:00",
+                "room": "HALL-A",
+            },
+            format="json",
+        )
+        self.assertEqual(outside.status_code, status.HTTP_400_BAD_REQUEST)
+
+        precheck = self.client.get(
+            "/api/v1/exams/conflicts/",
+            {
+                "class_id": self.cohort.pk,
+                "term_id": self.midterm.pk,
+                "subject_id": self.math.pk,
+                "exam_date": "2028-10-12",
+                "start_time": "09:00",
+                "end_time": "11:00",
+            },
+        )
+        self.assertEqual(precheck.status_code, status.HTTP_200_OK)
+        self.assertTrue(precheck.data["has_conflicts"])
+        self.assertTrue(
+            any("outside Academic Year" in c["message"] for c in precheck.data["cohort_conflicts"])
+        )
+
     def test_denied_roles_on_admin_endpoints(self):
         self.client.force_authenticate(self.teacher_user)
         self.assertEqual(self.client.get("/api/v1/exams/").status_code, status.HTTP_403_FORBIDDEN)

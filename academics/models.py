@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
@@ -6,6 +7,8 @@ from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.db.models import F, Q
 from django.utils import timezone
+
+ACADEMIC_YEAR_RE = re.compile(r"^(\d{4})-(\d{4})$")
 
 
 def grade_for(percentage):
@@ -45,8 +48,80 @@ class AcademicYear(ValidatedModel):
         ]
 
     def clean(self):
+        self.name = (self.name or "").strip()
+        match = ACADEMIC_YEAR_RE.match(self.name)
+        if not match:
+            raise ValidationError(
+                {
+                    "name": (
+                        "Academic year label must follow YYYY-YYYY format "
+                        "(e.g. 2026-2027)."
+                    )
+                }
+            )
+
+        start_year = int(match.group(1))
+        end_year = int(match.group(2))
+        if end_year <= start_year:
+            raise ValidationError(
+                {
+                    "name": (
+                        f"Invalid academic year range '{self.name}': "
+                        f"end year ({end_year}) must be after start year ({start_year}), "
+                        f"e.g. {start_year}-{start_year + 1}."
+                    )
+                }
+            )
+        if end_year != start_year + 1:
+            raise ValidationError(
+                {
+                    "name": (
+                        f"Academic year label '{self.name}' must span two consecutive years "
+                        f"(expected {start_year}-{start_year + 1})."
+                    )
+                }
+            )
+
         if self.start_date and self.end_date and self.end_date <= self.start_date:
             raise ValidationError({"end_date": "Must be after start_date."})
+        if self.start_date and self.start_date.year != start_year:
+            raise ValidationError(
+                {
+                    "start_date": (
+                        f"Start date year ({self.start_date.year}) must match "
+                        f"academic year label '{self.name}' ({start_year})."
+                    )
+                }
+            )
+        if self.end_date and self.end_date.year != end_year:
+            raise ValidationError(
+                {
+                    "end_date": (
+                        f"End date year ({self.end_date.year}) must match "
+                        f"academic year label '{self.name}' ({end_year})."
+                    )
+                }
+            )
+
+        if self.start_date and self.end_date:
+            conflict = (
+                AcademicYear.objects.filter(
+                    start_date__lte=self.end_date,
+                    end_date__gte=self.start_date,
+                )
+                .exclude(pk=self.pk)
+                .first()
+            )
+            if conflict is not None:
+                raise ValidationError(
+                    {
+                        "non_field_errors": (
+                            f"Date range conflict: {self.start_date} to {self.end_date} "
+                            f"overlaps with existing Academic Year {conflict.name} "
+                            f"({conflict.start_date} to {conflict.end_date})."
+                        )
+                    }
+                )
 
     def save(self, *args, **kwargs):
         # Automatically provision the two fixed exam terms: Midterm & Final Term.
@@ -194,8 +269,44 @@ class Exam(ValidatedModel):
             if self.pass_marks > self.max_marks:
                 raise ValidationError({"pass_marks": "Pass marks cannot exceed max marks."})
 
+        if self.term_id and self.exam_date:
+            academic_year = self.term.academic_year
+            if (
+                self.exam_date < academic_year.start_date
+                or self.exam_date > academic_year.end_date
+            ):
+                raise ValidationError(
+                    {
+                        "exam_date": (
+                            f"Exam date ({self.exam_date}) must fall within Academic Year "
+                            f"{academic_year.name} ({academic_year.start_date} to {academic_year.end_date})."
+                        )
+                    }
+                )
+
         if self.subject_id and self.term_id and not (self.title or "").strip():
             self.title = f"{self.subject.name} — {self.term.name}"
+
+        if self.term_id and self.class_obj_id and self.subject_id:
+            dup = (
+                Exam.objects.filter(
+                    term_id=self.term_id,
+                    class_obj_id=self.class_obj_id,
+                    subject_id=self.subject_id,
+                )
+                .exclude(pk=self.pk)
+                .select_related("subject", "term")
+                .first()
+            )
+            if dup is not None:
+                raise ValidationError(
+                    {
+                        "non_field_errors": (
+                            f"Subject conflict: {self.class_obj} already has "
+                            f"{dup.subject.name} scheduled in {dup.term.name} on {dup.exam_date}."
+                        )
+                    }
+                )
 
         if self.class_obj_id and self.exam_date and self.start_time and self.end_time:
             overlapping = (
@@ -332,6 +443,8 @@ def detect_exam_conflicts(
     end_time,
     room: str = "",
     exclude_exam_id: int | None = None,
+    term_id: int | None = None,
+    subject_id: int | None = None,
 ) -> dict:
     """Return cohort and optional room time-overlap warnings/conflicts for a candidate exam."""
     base_qs = Exam.objects.filter(
@@ -343,6 +456,57 @@ def detect_exam_conflicts(
         base_qs = base_qs.exclude(pk=exclude_exam_id)
 
     cohort_conflicts = []
+    if term_id is not None:
+        term_obj = Term.objects.select_related("academic_year").filter(pk=term_id).first()
+        if term_obj is not None:
+            ay = term_obj.academic_year
+            if exam_date < ay.start_date or exam_date > ay.end_date:
+                cohort_conflicts.append({
+                    "id": -term_obj.pk,
+                    "class_obj": class_obj_id,
+                    "class_label": "",
+                    "subject_id": subject_id or 0,
+                    "subject_name": "",
+                    "term_id": term_obj.pk,
+                    "term_name": term_obj.name,
+                    "exam_date": exam_date.isoformat(),
+                    "start_time": start_time.strftime("%H:%M"),
+                    "end_time": end_time.strftime("%H:%M"),
+                    "room": room,
+                    "message": (
+                        f"Date conflict: Exam date {exam_date} is outside Academic Year "
+                        f"{ay.name} ({ay.start_date} to {ay.end_date})."
+                    ),
+                })
+            if subject_id is not None:
+                dup_qs = Exam.objects.filter(
+                    term_id=term_id,
+                    class_obj_id=class_obj_id,
+                    subject_id=subject_id,
+                ).select_related("class_obj", "subject", "term")
+                if exclude_exam_id is not None:
+                    dup_qs = dup_qs.exclude(pk=exclude_exam_id)
+                dup = dup_qs.first()
+                if dup is not None:
+                    cohort_conflicts.append({
+                        "id": dup.pk,
+                        "class_obj": dup.class_obj_id,
+                        "class_label": str(dup.class_obj),
+                        "subject_id": dup.subject_id,
+                        "subject_name": dup.subject.name,
+                        "term_id": dup.term_id,
+                        "term_name": dup.term.name,
+                        "exam_date": dup.exam_date.isoformat(),
+                        "start_time": dup.start_time.strftime("%H:%M"),
+                        "end_time": dup.end_time.strftime("%H:%M"),
+                        "room": dup.room,
+                        "message": (
+                            f"Subject conflict: {dup.class_obj} already has {dup.subject.name} "
+                            f"scheduled in {dup.term.name} on {dup.exam_date} "
+                            f"({dup.start_time:%H:%M}–{dup.end_time:%H:%M})."
+                        ),
+                    })
+
     for conflict in base_qs.filter(class_obj_id=class_obj_id):
         cohort_conflicts.append({
             "id": conflict.pk,

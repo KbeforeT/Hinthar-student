@@ -177,6 +177,8 @@ class ExamViewSet(AcademicMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
         raw_end = request.query_params.get("end_time")
         raw_room = request.query_params.get("room", "")
         raw_exclude = request.query_params.get("exclude_id")
+        raw_term = request.query_params.get("term_id")
+        raw_subject = request.query_params.get("subject_id")
 
         if not (raw_class and raw_date and raw_start and raw_end):
             return Response(
@@ -189,6 +191,8 @@ class ExamViewSet(AcademicMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
             start_time = time.fromisoformat(raw_start)
             end_time = time.fromisoformat(raw_end)
             exclude_id = int(raw_exclude) if raw_exclude else None
+            term_id = int(raw_term) if raw_term else None
+            subject_id = int(raw_subject) if raw_subject else None
         except (TypeError, ValueError) as exc:
             return Response(
                 {"error": f"Invalid conflict check parameter: {exc}"},
@@ -209,6 +213,8 @@ class ExamViewSet(AcademicMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
                 end_time=end_time,
                 room=raw_room,
                 exclude_exam_id=exclude_id,
+                term_id=term_id,
+                subject_id=subject_id,
             )
         )
 
