@@ -150,7 +150,7 @@ class ExamViewSet(AcademicMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     serializer_class = ExamSerializer
     permission_classes = [IsStaffOrAbove]
     audit_category = "other"
-    audit_noun = "exam"
+    audit_noun = "exam schedule"
     filter_fields = {
         "term_id": "term_id",
         "academic_year_id": "term__academic_year_id",
@@ -233,11 +233,22 @@ class ExamViewSet(AcademicMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
             actor=request.user,
             default_exam=exam,
         )
+        if saved:
+            noun = "mark" if len(saved) == 1 else "marks"
+            log_event(
+                user=request.user,
+                category="other",
+                action="update",
+                summary=f"Recorded {len(saved)} {noun} for {exam.subject.name} ({exam.class_obj} — {exam.term.name})",
+                model_name="ExamResult",
+                record_id=exam.pk,
+            )
         return Response(
             {
                 "exam_id": exam.pk,
                 "saved_count": len(saved),
                 "results": ExamResultSerializer(saved, many=True).data,
+                "broadsheet": build_class_broadsheet(exam.term, exam.class_obj),
             },
             status=status.HTTP_200_OK,
         )
@@ -326,10 +337,35 @@ class ExamResultViewSet(AcademicMixin, AuditedViewSetMixin, viewsets.ModelViewSe
                 status=status.HTTP_400_BAD_REQUEST,
             )
         saved = _bulk_upsert_exam_results(records=records, actor=request.user)
+        if saved:
+            noun = "mark" if len(saved) == 1 else "marks"
+            first_exam = saved[0].exam
+            log_event(
+                user=request.user,
+                category="other",
+                action="update",
+                summary=f"Saved {len(saved)} {noun} for {first_exam.class_obj} ({first_exam.term.name})",
+                model_name="ExamResult",
+                record_id="",
+            )
+
+        broadsheet_payload = None
+        term_id = request.data.get("term_id") if isinstance(request.data, dict) else None
+        class_id = request.data.get("class_id") if isinstance(request.data, dict) else None
+        if term_id and class_id:
+            term_obj = Term.objects.select_related("academic_year").filter(pk=term_id).first()
+            class_obj = Class.objects.filter(pk=class_id).first()
+            if term_obj and class_obj:
+                broadsheet_payload = build_class_broadsheet(term_obj, class_obj)
+        elif saved:
+            first_exam = saved[0].exam
+            broadsheet_payload = build_class_broadsheet(first_exam.term, first_exam.class_obj)
+
         return Response(
             {
                 "saved_count": len(saved),
                 "results": ExamResultSerializer(saved, many=True).data,
+                "broadsheet": broadsheet_payload,
             },
             status=status.HTTP_200_OK,
         )

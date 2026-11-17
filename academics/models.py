@@ -9,11 +9,30 @@ from django.db.models import F, Q
 from django.utils import timezone
 
 ACADEMIC_YEAR_RE = re.compile(r"^(\d{4})-(\d{4})$")
+CANONICAL_STUDENT_CODE_RE = re.compile(r"^(?:HIS|SPD|SPN|YWM)\d{2}-\d{5}$")
+
+
+def format_student_identifier(student) -> str:
+    """Return canonical student identifier (e.g. SPD26-00043), normalizing legacy codes."""
+    raw = (getattr(student, "unique_code", None) or "").strip()
+    if CANONICAL_STUDENT_CODE_RE.match(raw):
+        return raw
+
+    trailing_digits = re.search(r"(\d+)\s*$", raw)
+    seq = int(trailing_digits.group(1)) if trailing_digits else (getattr(student, "pk", None) or 1)
+    enroll_date = getattr(student, "enrollment_date", None)
+    year_two = (enroll_date.year % 100) if enroll_date else 26
+    if raw:
+        school_code = "SPD"
+    else:
+        raw_school = (getattr(student, "school_code", None) or "SPD").upper()
+        school_code = raw_school if raw_school in ("HIS", "SPD", "SPN", "YWM") else "SPD"
+    return f"{school_code}{year_two:02d}-{seq:05d}"
 
 
 def grade_for(percentage):
-    """Continuous bands: A >= 80, B >= 70, C >= 60, D >= 50, F < 50."""
-    for minimum, letter in ((80, "A"), (70, "B"), (60, "C"), (50, "D")):
+    """Continuous bands: A* >= 90, A >= 80, B >= 70, C >= 60, D >= 50, F < 50."""
+    for minimum, letter in ((90, "A*"), (80, "A"), (70, "B"), (60, "C"), (50, "D")):
         if percentage >= minimum:
             return letter
     return "F"
@@ -202,7 +221,8 @@ class Term(ValidatedModel):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.academic_year} — {self.name}"
+        yr = self.academic_year.name if self.academic_year_id else "Unassigned"
+        return f"{yr} — {self.name}"
 
 
 class Exam(ValidatedModel):
@@ -333,7 +353,14 @@ class Exam(ValidatedModel):
                 )
 
     def __str__(self):
-        return f"{self.class_obj} / {self.subject} ({self.term.name})"
+        subject_label = self.subject.name if self.subject_id else "Subject"
+        cohort_label = str(self.class_obj) if self.class_obj_id else "Cohort"
+        term_label = self.term.name if self.term_id else "Term"
+        date_label = self.exam_date.isoformat() if self.exam_date else "TBA"
+        return f"{subject_label} — {cohort_label} ({term_label}, {date_label})"
+
+
+ExamSchedule = Exam
 
 
 class ExamResult(ValidatedModel):
@@ -432,7 +459,14 @@ class ExamResult(ValidatedModel):
                 )
 
     def __str__(self):
-        return f"{self.student} — {self.exam}: {self.marks_obtained}/{self.exam.max_marks}"
+        if self.student_id and self.exam_id:
+            code = format_student_identifier(self.student)
+            score_str = "Absent" if self.is_absent else f"{self.marks_obtained}/{self.exam.max_marks}"
+            return (
+                f"{self.student.name} ({code}) — "
+                f"{self.exam.subject.name} ({self.exam.term.name}): {score_str}"
+            )
+        return f"Exam Result #{self.pk or 'new'}"
 
 
 def detect_exam_conflicts(
@@ -614,7 +648,7 @@ def build_class_broadsheet(term: Term, class_obj) -> dict:
 
     ordered_students = sorted(
         student_map.values(),
-        key=lambda s: ((s.unique_code or ""), (s.name or "").lower(), s.pk),
+        key=lambda s: (format_student_identifier(s), (s.name or "").lower(), s.pk),
     )
 
     exam_result_counts: dict[int, int] = {eid: 0 for eid in exam_ids}
@@ -651,9 +685,11 @@ def build_class_broadsheet(term: Term, class_obj) -> dict:
             letter = None
             pf_status = "PENDING"
 
+        student_code = format_student_identifier(student)
         student_rows.append({
             "student_id": student.pk,
-            "unique_code": student.unique_code or f"#{student.pk}",
+            "unique_code": student_code,
+            "student_code": student_code,
             "name": student.name,
             "exam_candidate_number": student.exam_candidate_number,
             "marks_by_exam": marks_by_exam,
@@ -792,9 +828,11 @@ def build_parent_portal_data(
 
     def _serialize_student_ref(s):
         class_labels = [str(e.class_obj) for e in s.enrolled_classes.all() if e.class_obj]
+        code = format_student_identifier(s)
         return {
             "id": s.pk,
-            "unique_code": s.unique_code or f"#{s.pk}",
+            "unique_code": code,
+            "student_code": code,
             "name": s.name,
             "exam_candidate_number": s.exam_candidate_number,
             "class_labels": class_labels,

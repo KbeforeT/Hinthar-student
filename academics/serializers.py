@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import AcademicYear, Exam, ExamResult, Term
+from .models import AcademicYear, Exam, ExamResult, Term, format_student_identifier
 
 
 class TermSerializer(serializers.ModelSerializer):
@@ -97,7 +97,7 @@ class ExamSerializer(serializers.ModelSerializer):
 
 class ExamResultSerializer(serializers.ModelSerializer):
     student_name = serializers.CharField(source="student.name", read_only=True)
-    student_code = serializers.CharField(source="student.unique_code", read_only=True)
+    student_code = serializers.SerializerMethodField()
     exam_title = serializers.CharField(source="exam.title", read_only=True)
     max_marks = serializers.DecimalField(
         source="exam.max_marks", max_digits=8, decimal_places=2, read_only=True
@@ -145,3 +145,8 @@ class ExamResultSerializer(serializers.ModelSerializer):
             "recorded_by",
             "updated_at",
         ]
+
+    def get_student_code(self, obj):
+        if obj.student_id and obj.student:
+            return format_student_identifier(obj.student)
+        return None

@@ -1,10 +1,47 @@
 import contextvars
+import re
 from contextlib import contextmanager
 
+from django.core.cache import cache
 from rest_framework import status
 from rest_framework.response import Response
 
 from people.models import AuditLog
+
+RAW_OBJECT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+object\s*\((\d+)\)")
+
+_MODEL_LABELS = {
+    "ReportCard": "report card",
+    "AssessmentResult": "assessment result",
+    "ExamResult": "exam result",
+    "Exam": "exam schedule",
+    "ExamSchedule": "exam schedule",
+    "AcademicYear": "academic year",
+    "Term": "exam term",
+    "TeacherRateCard": "teacher rate card",
+    "CohortRateOverride": "cohort rate override",
+    "TeacherPayout": "teacher payout",
+}
+
+
+def clean_audit_summary(summary: str) -> str:
+    """Normalize legacy '<Model> object (<id>)' fragments into readable activity text."""
+    text = (summary or "").strip()
+    if not text:
+        return ""
+
+    def _replace_raw(match: re.Match) -> str:
+        raw_model, pk = match.group(1), match.group(2)
+        friendly = _MODEL_LABELS.get(raw_model) or re.sub(r"(?<!^)(?=[A-Z])", " ", raw_model).lower()
+        return f"{friendly} #{pk}"
+
+    cleaned = RAW_OBJECT_RE.sub(_replace_raw, text)
+    # Collapse doubled phrases like "Created report card report card #1" -> "Created report card #1"
+    for label in set(_MODEL_LABELS.values()):
+        doubled = f"{label} {label} #"
+        if doubled in cleaned:
+            cleaned = cleaned.replace(doubled, f"{label} #")
+    return cleaned[:255]
 
 _mute = contextvars.ContextVar('audit_mute', default=False)
 _actor = contextvars.ContextVar('audit_actor', default=None)
@@ -72,11 +109,11 @@ def log_event(
     actor_email = ''
     if actor is not None:
         actor_email = (getattr(actor, 'email', None) or getattr(actor, 'username', None) or '')[:255]
-    return AuditLog.objects.create(
+    row = AuditLog.objects.create(
         user=actor,
         user_email=actor_email,
         category=category,
-        summary=(summary or '')[:255],
+        summary=clean_audit_summary(summary),
         model_name=model_name or '',
         record_id=str(record_id) if record_id not in (None, '') else '',
         action=action,
@@ -84,6 +121,11 @@ def log_event(
         old_value=str(old_value) if old_value is not None else None,
         new_value=str(new_value) if new_value is not None else None,
     )
+    try:
+        cache.delete('stats_overview_v2')
+    except Exception:
+        pass
+    return row
 
 
 def log_sessions_generated(user, created_count, context_label):
@@ -132,8 +174,10 @@ class AuditedViewSetMixin(AuditActorMixin):
     def audit_label(self, instance):
         attr = self.audit_label_attr
         if attr:
-            return getattr(instance, attr, None) or str(instance)
-        return str(instance)
+            raw = getattr(instance, attr, None) or str(instance)
+        else:
+            raw = str(instance)
+        return clean_audit_summary(str(raw))
 
     def audit_summary(self, action, instance):
         verb = {'create': 'Created', 'update': 'Updated', 'delete': 'Deleted'}[action]

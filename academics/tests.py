@@ -9,7 +9,15 @@ from rest_framework.test import APIClient
 from people.models import Student, Subject, User
 from timetable.models import Class, ClassStudent, Course, StudentSubjectEnrollment
 
-from .models import AcademicYear, Exam, ExamResult, Term, grade_for
+from .models import (
+    AcademicYear,
+    Exam,
+    ExamResult,
+    ExamSchedule,
+    Term,
+    format_student_identifier,
+    grade_for,
+)
 
 
 class AcademicsExamTrackingTests(TestCase):
@@ -252,6 +260,8 @@ class AcademicsExamTrackingTests(TestCase):
         )
         self.assertEqual(res1.status_code, status.HTTP_200_OK, res1.data)
         self.assertEqual(res1.data["saved_count"], 3)
+        self.assertIn("broadsheet", res1.data)
+        self.assertEqual(res1.data["broadsheet"]["summary"]["graded_students_count"], 3)
 
         res2 = self.client.post(
             "/api/v1/exam-results/bulk_upsert/",
@@ -265,6 +275,7 @@ class AcademicsExamTrackingTests(TestCase):
             format="json",
         )
         self.assertEqual(res2.status_code, status.HTTP_200_OK, res2.data)
+        self.assertIn("broadsheet", res2.data)
 
         broadsheet = self.client.get(
             "/api/v1/academics/broadsheet/",
@@ -281,11 +292,12 @@ class AcademicsExamTrackingTests(TestCase):
         self.assertEqual(by_id[self.student1.pk]["rank"], 1)
         self.assertEqual(by_id[self.student2.pk]["rank"], 1)
         self.assertEqual(by_id[self.student3.pk]["rank"], 3)
-        self.assertEqual(by_id[self.student1.pk]["letter_grade"], "A")
+        self.assertEqual(by_id[self.student1.pk]["letter_grade"], "A*")
         self.assertEqual(by_id[self.student1.pk]["pass_fail_status"], "PASS")
         self.assertEqual(by_id[self.student3.pk]["letter_grade"], "F")
         self.assertEqual(by_id[self.student3.pk]["pass_fail_status"], "FAIL")
         self.assertTrue(by_id[self.student1.pk]["unique_code"].startswith("SPD"))
+        self.assertEqual(by_id[self.student1.pk]["student_code"], by_id[self.student1.pk]["unique_code"])
 
     def test_parent_portal_scoping_publish_gate_and_comparison(self):
         mid_math = Exam.objects.create(
@@ -384,9 +396,38 @@ class AcademicsExamTrackingTests(TestCase):
             ("70", "B"),
             ("79.99", "B"),
             ("80", "A"),
-            ("100", "A"),
+            ("89.99", "A"),
+            ("90", "A*"),
+            ("100", "A*"),
         ]:
             self.assertEqual(grade_for(Decimal(pct)), expected)
+
+    def test_student_identifier_and_readable_audit_strings(self):
+        from types import SimpleNamespace
+        from people.audit import clean_audit_summary
+
+        self.assertEqual(
+            format_student_identifier(SimpleNamespace(unique_code="DUMMY-IGK3-004", pk=4, enrollment_date=date(2026, 6, 1), school_code="SPD")),
+            "SPD26-00004",
+        )
+        self.assertEqual(
+            format_student_identifier(SimpleNamespace(unique_code="#0001-2023-001", pk=1, enrollment_date=date(2026, 6, 1), school_code="SPD")),
+            "SPD26-00001",
+        )
+        self.assertEqual(
+            format_student_identifier(SimpleNamespace(unique_code="SPD26-00043", pk=43, enrollment_date=date(2026, 6, 1), school_code="SPD")),
+            "SPD26-00043",
+        )
+
+        self.assertIs(ExamSchedule, Exam)
+        self.assertEqual(
+            clean_audit_summary("Created report card ReportCard object (1)"),
+            "Created report card #1",
+        )
+        self.assertEqual(
+            clean_audit_summary("Created assessment result AssessmentResult object (3)"),
+            "Created assessment result #3",
+        )
 
     def test_academic_year_conflict_and_label_validation(self):
         # Reversed label like 2028-2027 must be rejected

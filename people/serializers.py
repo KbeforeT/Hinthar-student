@@ -253,3 +253,9 @@ class AuditLogSerializer(serializers.ModelSerializer):
         if obj.user_email:
             return obj.user_email
         return obj.user.email if obj.user else None
+
+    def to_representation(self, instance):
+        from people.audit import clean_audit_summary
+        data = super().to_representation(instance)
+        data['summary'] = clean_audit_summary(data.get('summary') or '')
+        return data
