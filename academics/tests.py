@@ -344,14 +344,28 @@ class AcademicsExamTrackingTests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
         self.assertFalse(res.data["is_admin_preview"])
         self.assertEqual({s["id"] for s in res.data["accessible_students"]}, {self.student1.pk, self.student2.pk})
-        self.assertEqual(len(res.data["exam_schedule"]), 3)
+        # Strictly scoped to student1's assigned cohort (self.cohort); other_cohort exams are excluded
+        self.assertEqual(len(res.data["exam_schedule"]), 2)
+        self.assertEqual({e["class_id"] for e in res.data["exam_schedule"]}, {self.cohort.pk})
+        self.assertEqual({r["class_id"] for r in res.data["results_comparison"]}, {self.cohort.pk})
+        self.assertEqual(res.data["student"]["class_ids"], [self.cohort.pk])
 
-        # Unpublished marks are masked for parents
+        # Unpublished marks, grades, and term summaries are completely withheld for parents
         math_row = next(r for r in res.data["results_comparison"] if r["subject_id"] == self.math.pk)
         self.assertEqual(math_row["midterm"]["status"], "UNPUBLISHED")
         self.assertIsNone(math_row["midterm"]["marks_obtained"])
+        self.assertIsNone(math_row["midterm"]["percentage"])
+        self.assertIsNone(math_row["midterm"]["grade"])
+        self.assertIsNone(math_row["midterm"]["passed"])
+        self.assertEqual(math_row["midterm"]["remarks"], "")
         self.assertEqual(math_row["final_term"]["status"], "UNPUBLISHED")
+        self.assertIsNone(math_row["final_term"]["marks_obtained"])
+        self.assertIsNone(math_row["final_term"]["grade"])
         self.assertIsNone(math_row["delta_percentage"])
+        self.assertEqual(res.data["term_summaries"]["midterm"]["pass_fail_status"], "UNPUBLISHED")
+        self.assertIsNone(res.data["term_summaries"]["midterm"]["average_percentage"])
+        self.assertIsNone(res.data["term_summaries"]["midterm"]["letter_grade"])
+        self.assertIsNone(res.data["term_summaries"]["midterm"]["class_rank"])
 
         # Parent cannot view another family's student
         denied = self.client.get(
@@ -359,9 +373,27 @@ class AcademicsExamTrackingTests(TestCase):
         )
         self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
 
-        # Admin publishes Midterm and Final Term
+        # Publishing only Midterm releases Midterm marks while Final Term remains withheld
         self.client.force_authenticate(self.admin)
         self.client.post(f"/api/v1/terms/{self.midterm.pk}/publish/")
+
+        self.client.force_authenticate(self.parent_user)
+        res_mid_only = self.client.get(
+            "/api/v1/academics/parent-portal/", {"student_id": self.student1.pk}
+        )
+        self.assertEqual(res_mid_only.status_code, status.HTTP_200_OK, res_mid_only.data)
+        math_mid_only = next(
+            r for r in res_mid_only.data["results_comparison"] if r["subject_id"] == self.math.pk
+        )
+        self.assertEqual(math_mid_only["midterm"]["marks_obtained"], "72.00")
+        self.assertEqual(math_mid_only["midterm"]["grade"], "B")
+        self.assertEqual(math_mid_only["final_term"]["status"], "UNPUBLISHED")
+        self.assertIsNone(math_mid_only["final_term"]["marks_obtained"])
+        self.assertIsNone(math_mid_only["final_term"]["grade"])
+        self.assertIsNone(math_mid_only["delta_percentage"])
+
+        # Admin publishes Final Term too
+        self.client.force_authenticate(self.admin)
         self.client.post(f"/api/v1/terms/{self.final_term.pk}/publish/")
 
         # Parent now sees full Midterm vs Final Term comparison & +16.00 delta

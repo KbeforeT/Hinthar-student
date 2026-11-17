@@ -798,7 +798,7 @@ def build_parent_portal_data(
     from timetable.conflicts import get_student_active_course_pairs
     from timetable.models import Class, ClassStudent
 
-    staff_viewer = is_staff_or_above(user)
+    staff_viewer = is_staff_or_above(user) and getattr(user, "role", None) != "parent"
     if staff_viewer:
         accessible_qs = Student.objects.prefetch_related("enrolled_classes__class_obj").order_by("unique_code", "name", "pk")
     elif getattr(user, "role", None) == "parent":
@@ -827,7 +827,9 @@ def build_parent_portal_data(
         selected_year = next((y for y in years if y.is_active), years[0] if years else None)
 
     def _serialize_student_ref(s):
-        class_labels = [str(e.class_obj) for e in s.enrolled_classes.all() if e.class_obj]
+        enrollments = [e for e in s.enrolled_classes.all() if e.class_obj]
+        class_labels = [str(e.class_obj) for e in enrollments]
+        class_ids = [e.class_obj_id for e in enrollments]
         code = format_student_identifier(s)
         return {
             "id": s.pk,
@@ -835,6 +837,7 @@ def build_parent_portal_data(
             "student_code": code,
             "name": s.name,
             "exam_candidate_number": s.exam_candidate_number,
+            "class_ids": class_ids,
             "class_labels": class_labels,
         }
 
@@ -873,51 +876,56 @@ def build_parent_portal_data(
             "term_summaries": {"midterm": None, "final_term": None},
         }
 
-    active_pairs = get_student_active_course_pairs(selected_student.pk)
-    # Include any cohort/subject for which the student has an existing exam result in this academic year
-    student_year_results = list(
-        ExamResult.objects.filter(
-            student=selected_student,
-            exam__term__academic_year=selected_year,
-        ).select_related("exam", "exam__term", "exam__class_obj", "exam__subject")
-    )
-    for res in student_year_results:
-        active_pairs.add((res.exam.class_obj_id, res.exam.subject_id))
-
-    # Also if student has a primary cohort but no courses configured yet, include scheduled exams for their primary cohort
+    # Strictly scope Parent View exams/subjects to the student's assigned cohort(s).
     primary_class_ids = set(
         ClassStudent.objects.filter(student=selected_student).values_list("class_obj_id", flat=True)
     )
+    active_pairs = {
+        (cid, sid)
+        for cid, sid in get_student_active_course_pairs(selected_student.pk)
+        if cid in primary_class_ids
+    }
+
+    if primary_class_ids:
+        results_qs = ExamResult.objects.filter(
+            student=selected_student,
+            exam__term__academic_year=selected_year,
+            exam__class_obj_id__in=primary_class_ids,
+        ).select_related("exam", "exam__term", "exam__class_obj", "exam__subject")
+        if not staff_viewer:
+            results_qs = results_qs.filter(exam__term__is_published=True)
+        student_year_results = list(results_qs)
+    else:
+        student_year_results = []
+
+    for res in student_year_results:
+        active_pairs.add((res.exam.class_obj_id, res.exam.subject_id))
 
     year_terms = {t.number: t for t in selected_year.terms.all()}
     midterm_term = year_terms.get(1)
     final_term = year_terms.get(2)
 
-    # Fetch exams for this academic year across the student's enrolled (class_id, subject_id) or primary cohort
-    exam_filter = Q()
-    for cid, sid in active_pairs:
-        exam_filter |= Q(class_obj_id=cid, subject_id=sid)
     if primary_class_ids:
         from timetable.models import StudentSubjectEnrollment
         dropped_pairs = set(
             StudentSubjectEnrollment.objects.filter(
-                student=selected_student, status="dropped"
+                student=selected_student,
+                class_obj_id__in=primary_class_ids,
+                status="dropped",
             ).values_list("class_obj_id", "subject_id")
         )
-        exams_qs = Exam.objects.filter(term__academic_year=selected_year).filter(
-            exam_filter | Q(class_obj_id__in=primary_class_ids)
-        ).select_related("term", "class_obj", "subject").order_by("exam_date", "start_time", "pk")
+        exams_qs = (
+            Exam.objects.filter(
+                term__academic_year=selected_year,
+                class_obj_id__in=primary_class_ids,
+            )
+            .select_related("term", "class_obj", "subject")
+            .order_by("exam_date", "start_time", "pk")
+        )
         exams = [
             e for e in exams_qs
             if (e.class_obj_id, e.subject_id) not in dropped_pairs
         ]
-    elif active_pairs:
-        exams = list(
-            Exam.objects.filter(term__academic_year=selected_year)
-            .filter(exam_filter)
-            .select_related("term", "class_obj", "subject")
-            .order_by("exam_date", "start_time", "pk")
-        )
     else:
         exams = []
 
@@ -1019,6 +1027,7 @@ def build_parent_portal_data(
         if (
             mid_cell
             and fin_cell
+            and (staff_viewer or (mid_cell.get("is_published") and fin_cell.get("is_published")))
             and mid_cell.get("percentage") is not None
             and fin_cell.get("percentage") is not None
         ):
