@@ -48,6 +48,7 @@ User = get_user_model()
 
 STUDENT_LINKABLE_USER_ROLES = frozenset({'pending', 'student'})
 TEACHER_LINKABLE_USER_ROLES = frozenset({'pending', 'teacher'})
+PARENT_LINKABLE_USER_ROLES = frozenset({'pending', 'parent'})
 
 
 def _parse_linked_param(request):
@@ -445,7 +446,7 @@ class TeacherViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
 
 
 class StudentViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
-    queryset = Student.objects.select_related('user').order_by('id')
+    queryset = Student.objects.select_related('user', 'parent').order_by('id')
     serializer_class = StudentSerializer
     permission_classes = [IsStaffOrAbove]
     ordering = ['id']
@@ -508,10 +509,25 @@ class StudentViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
                 pass
 
         linked = _parse_linked_param(self.request)
+        linked_target = (self.request.query_params.get('linked_target') or 'user').strip().lower()
         if linked is True:
-            qs = qs.filter(user__isnull=False)
+            qs = (
+                qs.filter(parent__isnull=False)
+                if linked_target == 'parent'
+                else qs.filter(user__isnull=False)
+            )
         elif linked is False:
-            qs = qs.filter(user__isnull=True)
+            qs = (
+                qs.filter(parent__isnull=True)
+                if linked_target == 'parent'
+                else qs.filter(user__isnull=True)
+            )
+
+        parent_linked_raw = (self.request.query_params.get('parent_linked') or '').strip().lower()
+        if parent_linked_raw in ('true', '1', 'yes'):
+            qs = qs.filter(parent__isnull=False)
+        elif parent_linked_raw in ('false', '0', 'no'):
+            qs = qs.filter(parent__isnull=True)
 
         return qs
 
@@ -673,7 +689,7 @@ class StudentViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if target.role not in STUDENT_LINKABLE_USER_ROLES:
+        if target.role not in ('pending', 'student'):
             return Response(
                 {'error': f'Cannot link a {target.role} account to a student.'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -733,6 +749,117 @@ class StudentViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
         serializer = self.get_serializer(student)
         return Response(serializer.data)
 
+    @extend_schema(
+        request=inline_serializer(
+            name='LinkStudentParentRequest',
+            fields={'user_id': drf_serializers.IntegerField()},
+        ),
+        responses={200: StudentSerializer},
+        summary='Link a parent Clerk account to this student',
+        description=(
+            'Admin only. Sets Student.parent and promotes pending accounts to parent. '
+            'One parent account can be linked to multiple students.'
+        ),
+    )
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def link_parent(self, request, pk=None):
+        student = self.get_object()
+        if student.parent_id:
+            return Response(
+                {'error': 'This student is already linked to a parent account. Unlink first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_id = request.data.get('user_id')
+        try:
+            user_id = int(raw_id)
+        except (TypeError, ValueError):
+            return Response(
+                {'error': 'user_id is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            target = User.objects.get(pk=user_id)
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if target.role not in PARENT_LINKABLE_USER_ROLES:
+            return Response(
+                {'error': f'Cannot link a {target.role} account as a parent.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if _user_has_other_profile(target) or Student.objects.filter(user=target).exists():
+            return Response(
+                {'error': 'This account is already linked to an individual student, teacher, or staff profile.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            student.parent = target
+            student.save(update_fields=['parent'])
+            if target.role != 'parent':
+                target.role = 'parent'
+                target.save(update_fields=['role'])
+
+        parent_label = target.email or target.username
+        log_event(
+            user=request.user,
+            category=CATEGORY_STUDENT,
+            action='update',
+            summary=f"Linked parent {parent_label} to {student.name}",
+            model_name='Student',
+            record_id=student.pk,
+            field_name='parent',
+            new_value=parent_label,
+        )
+
+        serializer = self.get_serializer(student)
+        return Response(serializer.data)
+
+    @extend_schema(
+        responses={200: StudentSerializer},
+        summary='Unlink the parent account from this student',
+        description=(
+            'Admin only. Clears Student.parent. If the account role is parent and '
+            'no other children remain linked, it is set back to pending.'
+        ),
+    )
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def unlink_parent(self, request, pk=None):
+        student = self.get_object()
+        previous = student.parent
+        if previous is None:
+            return Response(
+                {'error': 'This student does not have a linked parent account.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            student.parent = None
+            student.save(update_fields=['parent'])
+            if previous.role == 'parent' and not previous.children.exists():
+                previous.role = 'pending'
+                previous.save(update_fields=['role'])
+
+        parent_label = previous.email or previous.username
+        log_event(
+            user=request.user,
+            category=CATEGORY_STUDENT,
+            action='update',
+            summary=f"Unlinked parent {parent_label} from {student.name}",
+            model_name='Student',
+            record_id=student.pk,
+            field_name='parent',
+            old_value=parent_label,
+        )
+
+        serializer = self.get_serializer(student)
+        return Response(serializer.data)
+
 
 class StaffViewSet(AuditedViewSetMixin, BulkOperationsMixin, ModelViewSet):
     queryset = Staff.objects.select_related('user').order_by('id')
@@ -785,7 +912,9 @@ class UserViewSet(AuditActorMixin, ModelViewSet):
         linked_target = (self.request.query_params.get('linked_target') or 'student').strip().lower()
         linked = _parse_linked_param(self.request)
         if linked is True:
-            if linked_target == 'teacher':
+            if linked_target == 'parent':
+                qs = qs.filter(children__isnull=False).distinct()
+            elif linked_target == 'teacher':
                 qs = qs.filter(teacher_profile__isnull=False)
             elif linked_target == 'staff':
                 qs = qs.filter(staff_profile__isnull=False)
@@ -794,11 +923,14 @@ class UserViewSet(AuditActorMixin, ModelViewSet):
                     Q(student_profile__isnull=False)
                     | Q(teacher_profile__isnull=False)
                     | Q(staff_profile__isnull=False)
-                )
+                    | Q(children__isnull=False)
+                ).distinct()
             else:
                 qs = qs.filter(student_profile__isnull=False)
         elif linked is False:
-            if linked_target == 'teacher':
+            if linked_target == 'parent':
+                qs = qs.filter(children__isnull=True)
+            elif linked_target == 'teacher':
                 qs = qs.filter(teacher_profile__isnull=True)
             elif linked_target == 'staff':
                 qs = qs.filter(staff_profile__isnull=True)
@@ -807,6 +939,7 @@ class UserViewSet(AuditActorMixin, ModelViewSet):
                     student_profile__isnull=True,
                     teacher_profile__isnull=True,
                     staff_profile__isnull=True,
+                    children__isnull=True,
                 )
             else:
                 qs = qs.filter(student_profile__isnull=True)
@@ -814,7 +947,14 @@ class UserViewSet(AuditActorMixin, ModelViewSet):
         linkable = (self.request.query_params.get('linkable') or '').strip().lower()
         linkable_target = (self.request.query_params.get('linkable_target') or 'student').strip().lower()
         if linkable in ('true', '1', 'yes'):
-            if linkable_target == 'teacher':
+            if linkable_target == 'parent':
+                qs = qs.filter(
+                    role__in=PARENT_LINKABLE_USER_ROLES,
+                    student_profile__isnull=True,
+                    teacher_profile__isnull=True,
+                    staff_profile__isnull=True,
+                )
+            elif linkable_target == 'teacher':
                 qs = qs.filter(
                     role__in=TEACHER_LINKABLE_USER_ROLES,
                     student_profile__isnull=True,

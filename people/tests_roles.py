@@ -719,3 +719,123 @@ class UserDeleteAndDeactivateTests(APITestCase):
         self.assertNotIn(self.admin.id, inactive_ids)
 
 
+class ParentAccountLinkTests(APITestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(
+            username='plink_admin', role='admin', clerk_id='clerk_plink_admin'
+        )
+        self.pending = User.objects.create_user(
+            username='plink_parent', role='pending', clerk_id='clerk_plink_parent'
+        )
+        self.child1 = Student.objects.create(name='Child One')
+        self.child2 = Student.objects.create(name='Child Two')
+
+    def test_admin_can_link_multiple_children_to_one_parent(self):
+        self.client.force_authenticate(user=self.admin)
+        res1 = self.client.post(
+            f'/api/v1/students/{self.child1.id}/link_parent/',
+            {'user_id': self.pending.id},
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data['parent_id'], self.pending.id)
+
+        res2 = self.client.post(
+            f'/api/v1/students/{self.child2.id}/link_parent/',
+            {'user_id': self.pending.id},
+            format='json',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.pending.refresh_from_db()
+        self.assertEqual(self.pending.role, 'parent')
+
+        # Check /me/ returns both children_ids
+        self.client.force_authenticate(user=self.pending)
+        me = self.client.get('/api/v1/me/')
+        self.assertEqual(me.status_code, status.HTTP_200_OK)
+        self.assertEqual(set(me.data['children_ids']), {self.child1.id, self.child2.id})
+
+        # Unlinking both demotes back to pending
+        self.client.force_authenticate(user=self.admin)
+        self.client.post(f'/api/v1/students/{self.child1.id}/unlink_parent/')
+        self.pending.refresh_from_db()
+        self.assertEqual(self.pending.role, 'parent')
+        self.client.post(f'/api/v1/students/{self.child2.id}/unlink_parent/')
+        self.pending.refresh_from_db()
+        self.assertEqual(self.pending.role, 'pending')
+
+    def test_parent_matching_filters_and_overwrite_guard(self):
+        other_parent = User.objects.create_user(
+            username='plink_other_parent', role='parent', clerk_id='clerk_plink_other'
+        )
+        unlinked_student = Student.objects.create(name='No Parent Yet')
+        self.client.force_authenticate(user=self.admin)
+
+        # Link child1 -> self.pending (promotes to parent)
+        res = self.client.post(
+            f'/api/v1/students/{self.child1.id}/link_parent/',
+            {'user_id': self.pending.id},
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        # Attempting to overwrite existing parent on child1 must be rejected
+        dup = self.client.post(
+            f'/api/v1/students/{self.child1.id}/link_parent/',
+            {'user_id': other_parent.id},
+            format='json',
+        )
+        self.assertEqual(dup.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # linkable_target=parent returns pending + parent accounts, excludes linked staff/students
+        linkable = self.client.get(
+            '/api/v1/users/',
+            {'linkable': 'true', 'linkable_target': 'parent'},
+        )
+        self.assertEqual(linkable.status_code, status.HTTP_200_OK)
+        linkable_ids = {u['id'] for u in linkable.data.get('results', linkable.data)}
+        self.assertIn(self.pending.id, linkable_ids)
+        self.assertIn(other_parent.id, linkable_ids)
+        self.assertNotIn(self.admin.id, linkable_ids)
+
+        # linked_target=parent returns parents with linked children
+        linked_parents = self.client.get(
+            '/api/v1/users/',
+            {'linked': 'true', 'linked_target': 'parent'},
+        )
+        self.assertEqual(linked_parents.status_code, status.HTTP_200_OK)
+        linked_ids = {u['id'] for u in linked_parents.data.get('results', linked_parents.data)}
+        self.assertIn(self.pending.id, linked_ids)
+        self.assertNotIn(other_parent.id, linked_ids)
+
+        # Student parent_linked filter separates linked vs unlinked students
+        unlinked_res = self.client.get('/api/v1/students/', {'parent_linked': 'false'})
+        self.assertEqual(unlinked_res.status_code, status.HTTP_200_OK)
+        unlinked_student_ids = {
+            s['id'] for s in unlinked_res.data.get('results', unlinked_res.data)
+        }
+        self.assertIn(unlinked_student.id, unlinked_student_ids)
+        self.assertNotIn(self.child1.id, unlinked_student_ids)
+
+        linked_res = self.client.get('/api/v1/students/', {'parent_linked': 'true'})
+        self.assertEqual(linked_res.status_code, status.HTTP_200_OK)
+        linked_student_ids = {
+            s['id'] for s in linked_res.data.get('results', linked_res.data)
+        }
+        self.assertIn(self.child1.id, linked_student_ids)
+        self.assertNotIn(unlinked_student.id, linked_student_ids)
+
+    def test_unlinked_parent_gets_clean_empty_portal_payload(self):
+        unlinked_parent = User.objects.create_user(
+            username='plink_zero', role='parent', clerk_id='clerk_plink_zero'
+        )
+        self.client.force_authenticate(user=unlinked_parent)
+        res = self.client.get('/api/v1/academics/parent-portal/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data['is_admin_preview'])
+        self.assertIsNone(res.data['student'])
+        self.assertEqual(res.data['accessible_students'], [])
+
+
+

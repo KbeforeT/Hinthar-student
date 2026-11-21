@@ -65,17 +65,32 @@ MIDDLEWARE = [
 ]
 
 # CORS — fully env-driven. Localhost is NOT auto-trusted in production.
-# Dev convenience: when DEBUG and CORS_ALLOWED_ORIGINS is empty, allow local Next.js.
+# Dev convenience: when DEBUG or localhost is present, ensure ports 3000 & 3001 are allowed.
 # Required for browser → Django (direct API) so Vercel does not proxy every call.
+_LOCAL_DEV_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+]
 _cors_env = os.getenv("CORS_ALLOWED_ORIGINS", "")
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
-if DEBUG and not CORS_ALLOWED_ORIGINS:
-    CORS_ALLOWED_ORIGINS = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-    ]
+if DEBUG or not CORS_ALLOWED_ORIGINS or any(
+    "localhost" in origin or "127.0.0.1" in origin for origin in CORS_ALLOWED_ORIGINS
+):
+    for _origin in _LOCAL_DEV_ORIGINS:
+        if _origin not in CORS_ALLOWED_ORIGINS:
+            CORS_ALLOWED_ORIGINS.append(_origin)
+
+_csrf_env = os.getenv("CSRF_TRUSTED_ORIGINS", "")
+CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(",") if o.strip()]
+if DEBUG or not CSRF_TRUSTED_ORIGINS or any(
+    "localhost" in origin or "127.0.0.1" in origin for origin in CSRF_TRUSTED_ORIGINS
+):
+    for _origin in _LOCAL_DEV_ORIGINS:
+        if _origin not in CSRF_TRUSTED_ORIGINS:
+            CSRF_TRUSTED_ORIGINS.append(_origin)
+
 CORS_ALLOW_CREDENTIALS = True
 # Cache preflight so browsers don't OPTIONS on every API call.
 CORS_PREFLIGHT_MAX_AGE = int(os.getenv("CORS_PREFLIGHT_MAX_AGE", "86400"))

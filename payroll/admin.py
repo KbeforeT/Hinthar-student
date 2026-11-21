@@ -1,25 +1,19 @@
-# Payroll admin archived — not yet a focus feature
+from django.contrib import admin
 
-# from django.contrib import admin
-# from payroll.models import PayPeriod, Payslip, Adjustment
-
-
-# @admin.register(PayPeriod)
-# class PayPeriodAdmin(admin.ModelAdmin):
-#     list_display = ('id', 'start_date', 'end_date')
-#     date_hierarchy = 'start_date'
+from .models import CohortRateOverride, TeacherPayout, TeacherRateCard
 
 
-# @admin.register(Payslip)
-# class PayslipAdmin(admin.ModelAdmin):
-#     list_display = ('id', 'teacher', 'pay_period', 'net_pay', 'status', 'issued_date')
-#     list_filter = ('status', 'pay_period')
-#     search_fields = ('teacher__name',)
-#     date_hierarchy = 'issued_date'
+@admin.register(TeacherRateCard)
+class TeacherRateCardAdmin(admin.ModelAdmin):
+    list_display = ("id", "teacher", "rate_type", "rate_per_session", "hourly_rate", "currency", "updated_at")
 
 
-# @admin.register(Adjustment)
-# class AdjustmentAdmin(admin.ModelAdmin):
-#     list_display = ('id', 'teacher', 'amount', 'status', 'created_date')
-#     list_filter = ('status', 'created_date')
-#     search_fields = ('teacher__name', 'reason')
+@admin.register(CohortRateOverride)
+class CohortRateOverrideAdmin(admin.ModelAdmin):
+    list_display = ("id", "rate_card", "class_obj", "rate_per_session", "hourly_rate")
+
+
+@admin.register(TeacherPayout)
+class TeacherPayoutAdmin(admin.ModelAdmin):
+    list_display = ("id", "teacher", "month", "sessions_count", "session_earnings", "bonus", "deduction", "net_payout", "status")
+    list_filter = ("status", "month")

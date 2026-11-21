@@ -22,6 +22,8 @@ def linked_profile_labels(user) -> list[str]:
     ):
         if _has_profile(user, attr):
             labels.append(label)
+    if user.children.exists():
+        labels.append('parent')
     return labels
 
 

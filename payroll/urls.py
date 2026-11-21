@@ -1,11 +1,14 @@
 from rest_framework.routers import DefaultRouter
 
-from .views import FeePaymentViewSet, StaffSalaryViewSet, StudentFeeViewSet
-
+from .views import (
+    CohortRateOverrideViewSet,
+    TeacherPayoutViewSet,
+    TeacherRateCardViewSet,
+)
 
 router = DefaultRouter()
-router.register("student-fees", StudentFeeViewSet, basename="student-fee")
-router.register("fee-payments", FeePaymentViewSet, basename="fee-payment")
-router.register("staff-salaries", StaffSalaryViewSet, basename="staff-salary")
+router.register("teacher-rate-cards", TeacherRateCardViewSet, basename="teacher-rate-card")
+router.register("cohort-rate-overrides", CohortRateOverrideViewSet, basename="cohort-rate-override")
+router.register("teacher-payouts", TeacherPayoutViewSet, basename="teacher-payout")
 
 urlpatterns = router.urls

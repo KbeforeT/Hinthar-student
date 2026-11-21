@@ -15,6 +15,8 @@ from django.db import connection
 from people.models import User, Teacher, Student, Subject
 from timetable.models import Class, ClassStudent, TimetableSlot
 from class_sessions.models import Session, SessionAttendance, CheckIn, AdHocSession, AdHocSessionAttendance
+from academics.models import AcademicYear, Exam, ExamResult, Term
+from payroll.models import CohortRateOverride, TeacherPayout, TeacherRateCard, sync_teacher_payout
 from datetime import date, timedelta, time, datetime as dt
 from decimal import Decimal
 import random
@@ -221,6 +223,13 @@ class Command(BaseCommand):
         """Truncate all tables in dependency order."""
         self.stdout.write('Clearing existing data...')
         models = [
+            ExamResult,
+            Exam,
+            Term,
+            AcademicYear,
+            TeacherPayout,
+            CohortRateOverride,
+            TeacherRateCard,
             CheckIn,
             AdHocSessionAttendance,
             SessionAttendance,
@@ -473,6 +482,98 @@ class Command(BaseCommand):
         CheckIn.objects.bulk_create(checkin_bulk, ignore_conflicts=True)
         self.stdout.write(f'  Created {CheckIn.objects.count()} Check-Ins')
 
+        # ── 8. Academics (AcademicYear, Fixed Terms, Exams, Results) ──
+        self.stdout.write('\n--- Creating Academics Data ---')
+        year_obj = AcademicYear.objects.create(
+            name='2026-2027',
+            start_date=date(2026, 6, 1),
+            end_date=date(2027, 5, 31),
+            is_active=True,
+        )
+        midterm = year_obj.terms.get(number=1)
+        midterm.is_published = True
+        midterm.save()
+        final_term = year_obj.terms.get(number=2)
+
+        exam_windows = [
+            (time(9, 0), time(11, 0)),
+            (time(13, 0), time(15, 0)),
+        ]
+        created_exams = []
+        for cls in class_objs:
+            cls_subject_ids = list(
+                TimetableSlot.objects.filter(class_obj=cls)
+                .values_list('subject_id', flat=True)
+                .distinct()[:4]
+            )
+            for idx, subj_id in enumerate(cls_subject_ids):
+                win_start, win_end = exam_windows[idx % 2]
+                day_offset = idx // 2
+                m_exam = Exam.objects.create(
+                    term=midterm,
+                    class_obj=cls,
+                    subject_id=subj_id,
+                    exam_date=date(2026, 10, 12) + timedelta(days=day_offset),
+                    start_time=win_start,
+                    end_time=win_end,
+                    room=f'HALL-{101 + (idx % 4)}',
+                    max_marks=Decimal('100.00'),
+                    pass_marks=Decimal('50.00'),
+                )
+                f_exam = Exam.objects.create(
+                    term=final_term,
+                    class_obj=cls,
+                    subject_id=subj_id,
+                    exam_date=date(2027, 3, 15) + timedelta(days=day_offset),
+                    start_time=win_start,
+                    end_time=win_end,
+                    room=f'HALL-{101 + (idx % 4)}',
+                    max_marks=Decimal('100.00'),
+                    pass_marks=Decimal('50.00'),
+                )
+                created_exams.extend([m_exam, f_exam])
+
+                for st in cls_students_map.get(cls.id, []):
+                    score_m = Decimal(str(random.randint(42, 98)))
+                    ExamResult.objects.create(
+                        exam=m_exam,
+                        student=st,
+                        marks_obtained=score_m,
+                        remarks='Consistent performance' if score_m >= 70 else 'Needs revision',
+                    )
+                    score_f = Decimal(str(min(100, int(score_m) + random.randint(-5, 10))))
+                    ExamResult.objects.create(
+                        exam=f_exam,
+                        student=st,
+                        marks_obtained=score_f,
+                        remarks='Strong final improvement' if score_f > score_m else 'Steady progress',
+                    )
+
+        self.stdout.write(f'  Created {len(created_exams)} Exams and {ExamResult.objects.count()} Results')
+
+        # ── 9. Payroll (Teacher Rate Cards & Monthly Payouts) ──
+        self.stdout.write('\n--- Creating Payroll Data ---')
+        ig_classes = [c for c in class_objs if c.education_level == 'IG']
+        for idx, teacher in enumerate(teacher_objs):
+            base_val = TEACHERS[idx][2] if idx < len(TEACHERS) else Decimal('28.00')
+            use_hourly = (idx % 3 == 0)
+            card = TeacherRateCard.objects.create(
+                teacher=teacher,
+                rate_type=TeacherRateCard.RateType.HOURLY if use_hourly else TeacherRateCard.RateType.PER_SESSION,
+                rate_per_session=(base_val * Decimal('1000.00')),
+                hourly_rate=(base_val * Decimal('1200.00')),
+                currency='MMK',
+            )
+            if ig_classes and idx % 2 == 0:
+                target_cls = ig_classes[idx % len(ig_classes)]
+                CohortRateOverride.objects.create(
+                    rate_card=card,
+                    class_obj=target_cls,
+                    rate_per_session=(base_val * Decimal('1250.00')),
+                    hourly_rate=(base_val * Decimal('1500.00')),
+                )
+            sync_teacher_payout(teacher, today.replace(day=1))
+
         # ── Summary ──
         self.stdout.write('\n' + '=' * 60)
         self.stdout.write('POPULATION COMPLETE')
@@ -486,3 +587,7 @@ class Command(BaseCommand):
         self.stdout.write(f'  Sessions:           {Session.objects.count()}')
         self.stdout.write(f'  Attendance Records: {SessionAttendance.objects.count()}')
         self.stdout.write(f'  Check-Ins:          {CheckIn.objects.count()}')
+        self.stdout.write(f'  Exams:              {Exam.objects.count()}')
+        self.stdout.write(f'  Exam Results:       {ExamResult.objects.count()}')
+        self.stdout.write(f'  Teacher Rate Cards: {TeacherRateCard.objects.count()}')
+        self.stdout.write(f'  Teacher Payouts:    {TeacherPayout.objects.count()}')
